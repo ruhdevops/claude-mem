@@ -8,6 +8,27 @@
 import path from 'path';
 import { logger } from '../utils/logger.js';
 
+// Cached formatters for performance optimization (re-using Intl.DateTimeFormat is significantly faster than toLocaleString)
+const dateTimeFormatter = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+  hour12: true
+});
+
+const timeFormatter = new Intl.DateTimeFormat('en-US', {
+  hour: 'numeric',
+  minute: '2-digit',
+  hour12: true
+});
+
+const dateFormatter = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric'
+});
+
 /**
  * Parse JSON array string, returning empty array on failure
  */
@@ -29,14 +50,7 @@ export function parseJsonArray(json: string | null): string[] {
  * Accepts either ISO date string or epoch milliseconds
  */
 export function formatDateTime(dateInput: string | number): string {
-  const date = new Date(dateInput);
-  return date.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
+  return dateTimeFormatter.format(new Date(dateInput));
 }
 
 /**
@@ -44,12 +58,7 @@ export function formatDateTime(dateInput: string | number): string {
  * Accepts either ISO date string or epoch milliseconds
  */
 export function formatTime(dateInput: string | number): string {
-  const date = new Date(dateInput);
-  return date.toLocaleString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
+  return timeFormatter.format(new Date(dateInput));
 }
 
 /**
@@ -57,12 +66,7 @@ export function formatTime(dateInput: string | number): string {
  * Accepts either ISO date string or epoch milliseconds
  */
 export function formatDate(dateInput: string | number): string {
-  const date = new Date(dateInput);
-  return date.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric'
-  });
+  return dateFormatter.format(new Date(dateInput));
 }
 
 /**
