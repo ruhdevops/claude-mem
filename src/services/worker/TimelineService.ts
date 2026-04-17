@@ -6,6 +6,7 @@
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult } from '../sqlite/types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { logger } from '../../utils/logger.js';
+import { formatDate, formatTime, formatDateTime } from '../../shared/timeline-formatting.js';
 
 /**
  * Timeline item for unified chronological display
@@ -111,7 +112,7 @@ export class TimelineService {
     // Group by day
     const dayMap = new Map<string, TimelineItem[]>();
     for (const item of items) {
-      const day = this.formatDate(item.epoch);
+      const day = formatDate(item.epoch);
       if (!dayMap.has(day)) {
         dayMap.set(day, []);
       }
@@ -152,7 +153,7 @@ export class TimelineService {
           const title = sess.request || 'Session summary';
           const marker = isAnchor ? ' ← **ANCHOR**' : '';
 
-          lines.push(`**🎯 #S${sess.id}** ${title} (${this.formatDateTime(item.epoch)})${marker}`);
+          lines.push(`**🎯 #S${sess.id}** ${title} (${formatDateTime(item.epoch)})${marker}`);
           lines.push('');
         } else if (item.type === 'prompt') {
           if (tableOpen) {
@@ -165,7 +166,7 @@ export class TimelineService {
           const prompt = item.data as UserPromptSearchResult;
           const truncated = prompt.prompt_text.length > 100 ? prompt.prompt_text.substring(0, 100) + '...' : prompt.prompt_text;
 
-          lines.push(`**💬 User Prompt #${prompt.prompt_number}** (${this.formatDateTime(item.epoch)})`);
+          lines.push(`**💬 User Prompt #${prompt.prompt_number}** (${formatDateTime(item.epoch)})`);
           lines.push(`> ${truncated}`);
           lines.push('');
         } else if (item.type === 'observation') {
@@ -187,7 +188,7 @@ export class TimelineService {
           }
 
           const icon = this.getTypeIcon(obs.type);
-          const time = this.formatTime(item.epoch);
+          const time = formatTime(item.epoch);
           const title = obs.title || 'Untitled';
           const tokens = this.estimateTokens(obs.narrative);
 
@@ -213,44 +214,6 @@ export class TimelineService {
    */
   private getTypeIcon(type: string): string {
     return ModeManager.getInstance().getTypeIcon(type);
-  }
-
-  /**
-   * Format date for grouping (e.g., "Dec 7, 2025")
-   */
-  private formatDate(epochMs: number): string {
-    const date = new Date(epochMs);
-    return date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric'
-    });
-  }
-
-  /**
-   * Format time (e.g., "6:30 PM")
-   */
-  private formatTime(epochMs: number): string {
-    const date = new Date(epochMs);
-    return date.toLocaleString('en-US', {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true
-    });
-  }
-
-  /**
-   * Format date and time (e.g., "Dec 7, 6:30 PM")
-   */
-  private formatDateTime(epochMs: number): string {
-    const date = new Date(epochMs);
-    return date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true
-    });
   }
 
   /**
