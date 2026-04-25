@@ -3,6 +3,7 @@
  */
 
 import type { Response } from 'express';
+import type { RestartGuard } from './worker/RestartGuard.js';
 
 // ============================================================================
 // Active Session Types
@@ -34,7 +35,8 @@ export interface ActiveSession {
   earliestPendingTimestamp: number | null;  // Original timestamp of earliest pending message (for accurate observation timestamps)
   conversationHistory: ConversationMessage[];  // Shared conversation history for provider switching
   currentProvider: 'claude' | 'gemini' | 'openrouter' | null;  // Track which provider is currently running
-  consecutiveRestarts: number;  // Track consecutive restart attempts to prevent infinite loops
+  consecutiveRestarts: number;  // DEPRECATED: use restartGuard. Kept for logging compat.
+  restartGuard?: RestartGuard;
   forceInit?: boolean;  // Force fresh SDK session (skip resume)
   idleTimedOut?: boolean;  // Set when session exits due to idle timeout (prevents restart loop)
   lastGeneratorActivity: number;  // Timestamp of last generator progress (for stale detection, Issue #1099)
@@ -46,6 +48,14 @@ export interface ActiveSession {
   // Track whether the most recent storage operation persisted a summary record.
   // Used by the status endpoint so the Stop hook can detect silent summary loss (#1633).
   lastSummaryStored?: boolean;
+  // Circuit breaker: track consecutive summary failures to prevent infinite retry loops (#1633).
+  // When this reaches MAX_CONSECUTIVE_SUMMARY_FAILURES, further summarize requests are skipped.
+  consecutiveSummaryFailures: number;
+  // Subagent identity carried forward from the most recent claimed pending message.
+  // When observations are parsed and stored, these fields label the resulting rows
+  // so subagent work is attributable. NULL / undefined means the batch came from the main session.
+  pendingAgentId?: string | null;
+  pendingAgentType?: string | null;
 }
 
 export interface PendingMessage {
@@ -56,6 +66,9 @@ export interface PendingMessage {
   prompt_number?: number;
   cwd?: string;
   last_assistant_message?: string;
+  // Claude Code subagent identity — present only when the hook fired inside a subagent.
+  agentId?: string;
+  agentType?: string;
 }
 
 /**
@@ -74,6 +87,9 @@ export interface ObservationData {
   tool_response: any;
   prompt_number: number;
   cwd?: string;
+  // Claude Code subagent identity — present only when the hook fired inside a subagent.
+  agentId?: string;
+  agentType?: string;
 }
 
 // ============================================================================
@@ -124,6 +140,7 @@ export interface Observation {
   id: number;
   memory_session_id: string;  // Renamed from sdk_session_id
   project: string;
+  merged_into_project: string | null;
   platform_source: string;
   type: string;
   title: string;

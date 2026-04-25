@@ -76,6 +76,12 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_API_KEY: string;
   CLAUDE_MEM_CHROMA_TENANT: string;
   CLAUDE_MEM_CHROMA_DATABASE: string;
+  // Telegram Notifier
+  CLAUDE_MEM_TELEGRAM_ENABLED: string;
+  CLAUDE_MEM_TELEGRAM_BOT_TOKEN: string;
+  CLAUDE_MEM_TELEGRAM_CHAT_ID: string;
+  CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: string;
+  CLAUDE_MEM_TELEGRAM_TRIGGER_CONCEPTS: string;
 }
 
 export class SettingsDefaultsManager {
@@ -85,7 +91,7 @@ export class SettingsDefaultsManager {
   private static readonly DEFAULTS: SettingsDefaults = {
     CLAUDE_MEM_MODEL: 'claude-sonnet-4-6',
     CLAUDE_MEM_CONTEXT_OBSERVATIONS: '50',
-    CLAUDE_MEM_WORKER_PORT: '37777',
+    CLAUDE_MEM_WORKER_PORT: String(37700 + ((process.getuid?.() ?? 77) % 100)),
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1',
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
     // AI Provider Configuration
@@ -147,6 +153,12 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CHROMA_API_KEY: '',
     CLAUDE_MEM_CHROMA_TENANT: 'default_tenant',
     CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
+    // Telegram Notifier
+    CLAUDE_MEM_TELEGRAM_ENABLED: 'true',
+    CLAUDE_MEM_TELEGRAM_BOT_TOKEN: '',
+    CLAUDE_MEM_TELEGRAM_CHAT_ID: '',
+    CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: 'security_alert',
+    CLAUDE_MEM_TELEGRAM_TRIGGER_CONCEPTS: '',
   };
 
   /**
@@ -221,8 +233,8 @@ export class SettingsDefaultsManager {
           writeFileSync(settingsPath, JSON.stringify(defaults, null, 2), 'utf-8');
           // Use console instead of logger to avoid circular dependency
           console.log('[SETTINGS] Created settings file with defaults:', settingsPath);
-        } catch (error) {
-          console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error);
+        } catch (error: unknown) {
+          console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error instanceof Error ? error.message : String(error));
         }
         // Still apply env var overrides even when file doesn't exist
         return this.applyEnvOverrides(defaults);
@@ -241,8 +253,8 @@ export class SettingsDefaultsManager {
         try {
           writeFileSync(settingsPath, JSON.stringify(flatSettings, null, 2), 'utf-8');
           console.log('[SETTINGS] Migrated settings file from nested to flat schema:', settingsPath);
-        } catch (error) {
-          console.warn('[SETTINGS] Failed to auto-migrate settings file:', settingsPath, error);
+        } catch (error: unknown) {
+          console.warn('[SETTINGS] Failed to auto-migrate settings file:', settingsPath, error instanceof Error ? error.message : String(error));
           // Continue with in-memory migration even if write fails
         }
       }
@@ -257,8 +269,8 @@ export class SettingsDefaultsManager {
 
       // Apply environment variable overrides (highest priority)
       return this.applyEnvOverrides(result);
-    } catch (error) {
-      console.warn('[SETTINGS] Failed to load settings, using defaults:', settingsPath, error);
+    } catch (error: unknown) {
+      console.warn('[SETTINGS] Failed to load settings, using defaults:', settingsPath, error instanceof Error ? error.message : String(error));
       // Still apply env var overrides even on error
       return this.applyEnvOverrides(this.getAllDefaults());
     }

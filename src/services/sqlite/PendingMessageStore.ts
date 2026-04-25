@@ -24,6 +24,9 @@ export interface PersistentPendingMessage {
   created_at_epoch: number;
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
+  // Claude Code subagent identity — NULL for main-session messages.
+  agent_type: string | null;
+  agent_id: string | null;
 }
 
 /**
@@ -64,8 +67,9 @@ export class PendingMessageStore {
         session_db_id, content_session_id, message_type,
         tool_name, tool_input, tool_response, cwd,
         last_assistant_message,
-        prompt_number, status, retry_count, created_at_epoch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+        prompt_number, status, retry_count, created_at_epoch,
+        agent_type, agent_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
     `);
 
     const result = stmt.run(
@@ -78,7 +82,9 @@ export class PendingMessageStore {
       message.cwd || null,
       message.last_assistant_message || null,
       message.prompt_number || null,
-      now
+      now,
+      message.agentType ?? null,
+      message.agentId ?? null
     );
 
     return result.lastInsertRowid as number;
@@ -472,6 +478,25 @@ export class PendingMessageStore {
   }
 
   /**
+   * Clear failed messages older than the given threshold.
+   * Preserves recent failures for inspection and manual retry.
+   * @param thresholdMs - Only delete failures older than this many milliseconds
+   * @returns Number of messages deleted
+   */
+  clearFailedOlderThan(thresholdMs: number): number {
+    const cutoff = Date.now() - thresholdMs;
+    // Use COALESCE to prefer the most recent failure timestamp over creation time.
+    // failed_at_epoch is set by session-level failures, completed_at_epoch by markFailed().
+    const stmt = this.db.prepare(`
+      DELETE FROM pending_messages
+      WHERE status = 'failed'
+        AND COALESCE(failed_at_epoch, completed_at_epoch, started_processing_at_epoch, created_at_epoch) < ?
+    `);
+    const result = stmt.run(cutoff);
+    return result.changes;
+  }
+
+  /**
    * Clear all pending, processing, and failed messages from the queue
    * Keeps only processed messages (for history)
    * @returns Number of messages deleted
@@ -496,7 +521,9 @@ export class PendingMessageStore {
       tool_response: persistent.tool_response ? JSON.parse(persistent.tool_response) : undefined,
       prompt_number: persistent.prompt_number || undefined,
       cwd: persistent.cwd || undefined,
-      last_assistant_message: persistent.last_assistant_message || undefined
+      last_assistant_message: persistent.last_assistant_message || undefined,
+      agentId: persistent.agent_id ?? undefined,
+      agentType: persistent.agent_type ?? undefined
     };
   }
 }

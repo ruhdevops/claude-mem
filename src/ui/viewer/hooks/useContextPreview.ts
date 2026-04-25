@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { ProjectCatalog, Settings } from '../types';
+import { authFetch } from '../utils/api';
 
 interface UseContextPreviewResult {
   preview: string;
@@ -37,32 +38,35 @@ export function useContextPreview(settings: Settings): UseContextPreviewResult {
   // Fetch projects on mount
   useEffect(() => {
     async function fetchProjects() {
+      let data: ProjectCatalog;
       try {
-        const response = await fetch('/api/projects');
-        const data = await response.json() as ProjectCatalog;
-        const nextCatalog: ProjectCatalog = {
-          projects: data.projects || [],
-          sources: withDefaultSources(data.sources || []),
-          projectsBySource: data.projectsBySource || {}
-        };
-
-        setCatalog(nextCatalog);
-
-        const preferredSource = getPreferredSource(nextCatalog.sources);
-        setSelectedSource(preferredSource);
-
-        if (preferredSource) {
-          const sourceProjects = nextCatalog.projectsBySource[preferredSource] || [];
-          setProjects(sourceProjects);
-          setSelectedProject(sourceProjects[0] || null);
-          return;
-        }
-
-        setProjects(nextCatalog.projects);
-        setSelectedProject(nextCatalog.projects[0] || null);
-      } catch (err) {
-        console.error('Failed to fetch projects:', err);
+        const response = await authFetch('/api/projects');
+        data = await response.json() as ProjectCatalog;
+      } catch (err: unknown) {
+        console.error('Failed to fetch projects:', err instanceof Error ? err.message : String(err));
+        return;
       }
+
+      const nextCatalog: ProjectCatalog = {
+        projects: data.projects || [],
+        sources: withDefaultSources(data.sources || []),
+        projectsBySource: data.projectsBySource || {}
+      };
+
+      setCatalog(nextCatalog);
+
+      const preferredSource = getPreferredSource(nextCatalog.sources);
+      setSelectedSource(preferredSource);
+
+      if (preferredSource) {
+        const sourceProjects = nextCatalog.projectsBySource[preferredSource] || [];
+        setProjects(sourceProjects);
+        setSelectedProject(sourceProjects[0] || null);
+        return;
+      }
+
+      setProjects(nextCatalog.projects);
+      setSelectedProject(nextCatalog.projects[0] || null);
     }
     fetchProjects();
   }, []);
@@ -97,7 +101,7 @@ export function useContextPreview(settings: Settings): UseContextPreviewResult {
     }
 
     try {
-      const response = await fetch(`/api/context/preview?${params}`);
+      const response = await authFetch(`/api/context/preview?${params}`);
       const text = await response.text();
 
       if (response.ok) {
@@ -105,7 +109,8 @@ export function useContextPreview(settings: Settings): UseContextPreviewResult {
       } else {
         setError('Failed to load preview');
       }
-    } catch {
+    } catch (error: unknown) {
+      console.error('Failed to load context preview:', error instanceof Error ? error.message : String(error));
       setError('Failed to load preview');
     }
 

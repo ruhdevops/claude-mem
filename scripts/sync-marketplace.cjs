@@ -108,9 +108,13 @@ try {
   // Trigger worker restart after file sync
   console.log('\n🔄 Triggering worker restart...');
   const http = require('http');
+  const os = require('os');
+  // Use per-user port derivation (#1936)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 77;
+  const workerPort = parseInt(process.env.CLAUDE_MEM_WORKER_PORT || String(37700 + (uid % 100)), 10);
   const req = http.request({
     hostname: '127.0.0.1',
-    port: 37777,
+    port: workerPort,
     path: '/api/admin/restart',
     method: 'POST',
     timeout: 2000

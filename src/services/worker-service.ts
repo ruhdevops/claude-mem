@@ -28,6 +28,7 @@ import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 // ensure the worker daemon is up without importing this entire module — which
 // transitively pulls in the SQLite database layer via ChromaSync/DatabaseManager.
 import { ensureWorkerStarted as ensureWorkerStartedShared } from './worker-spawner.js';
+import { RestartGuard } from './worker/RestartGuard.js';
 
 // Re-export for backward compatibility — canonical implementation in shared/plugin-state.ts
 export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
@@ -45,8 +46,9 @@ import {
   getPlatformTimeout,
   aggressiveStartupCleanup,
   runOneTimeChromaMigration,
+  runOneTimeCwdRemap,
   cleanStalePidFile,
-  isProcessAlive,
+  verifyPidFileOwnership,
   spawnDaemon,
   touchPidFile
 } from './infrastructure/ProcessManager.js';
@@ -58,6 +60,7 @@ import {
   httpShutdown
 } from './infrastructure/HealthMonitor.js';
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
+import { adoptMergedWorktrees, adoptMergedWorktreesForAllKnownRepos } from './infrastructure/WorktreeAdoption.js';
 
 // Server imports
 import { Server } from './server/Server.js';
@@ -84,6 +87,7 @@ import { SearchManager } from './worker/SearchManager.js';
 import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
+import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, loadTranscriptWatchConfig, writeSampleConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
 
@@ -149,6 +153,7 @@ export class WorkerService {
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
+  private sessionCompletionHandler: SessionCompletionHandler;
   private corpusStore: CorpusStore;
 
   // Route handlers
@@ -195,6 +200,11 @@ export class WorkerService {
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
     this.sessionEventBroadcaster = new SessionEventBroadcaster(this.sseBroadcaster, this);
+    this.sessionCompletionHandler = new SessionCompletionHandler(
+      this.sessionManager,
+      this.sessionEventBroadcaster,
+      this.dbManager
+    );
     this.corpusStore = new CorpusStore();
 
     // Set callback for when sessions are deleted
@@ -287,17 +297,22 @@ export class WorkerService {
         await Promise.race([this.initializationComplete, timeoutPromise]);
         next();
       } catch (error) {
-        logger.error('HTTP', `Request to ${req.method} ${req.path} rejected — DB not initialized`, {}, error as Error);
+        if (error instanceof Error) {
+          logger.error('WORKER', `Request to ${req.method} ${req.path} rejected — DB not initialized`, {}, error);
+        } else {
+          logger.error('WORKER', `Request to ${req.method} ${req.path} rejected — DB not initialized with non-Error`, {}, new Error(String(error)));
+        }
         res.status(503).json({
           error: 'Service initializing',
           message: 'Database is still initializing, please retry'
         });
+        return;
       }
     });
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.sessionCompletionHandler));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -357,6 +372,42 @@ export class WorkerService {
       // Only runs in local mode (chroma is local-only). Backfill at line ~414 rebuilds from SQLite.
       if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
         runOneTimeChromaMigration();
+      }
+
+      // One-time remap of pre-worktree project names using pending_messages.cwd.
+      // Must run before dbManager.initialize() so we don't hold the DB open.
+      runOneTimeCwdRemap();
+
+      // Stamp merged worktrees so their observations surface under the parent
+      // project. Runs every startup (not marker-gated) because git state evolves
+      // and the engine is fully idempotent. Must also precede dbManager.initialize().
+      //
+      // The worker daemon is spawned with cwd=marketplace-plugin-dir (not a git
+      // repo), so we can't seed adoption with process.cwd(). Instead, discover
+      // parent repos from recorded pending_messages.cwd values.
+      let adoptions: Awaited<ReturnType<typeof adoptMergedWorktreesForAllKnownRepos>> | null = null;
+      try {
+        adoptions = await adoptMergedWorktreesForAllKnownRepos({});
+      } catch (err) {
+        // [ANTI-PATTERN IGNORED]: Worktree adoption is best-effort on startup; failure must not block worker initialization
+        if (err instanceof Error) {
+          logger.error('WORKER', 'Worktree adoption failed (non-fatal)', {}, err);
+        } else {
+          logger.error('WORKER', 'Worktree adoption failed (non-fatal) with non-Error', {}, new Error(String(err)));
+        }
+      }
+      if (adoptions) {
+        for (const adoption of adoptions) {
+          if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
+            logger.info('SYSTEM', 'Merged worktrees adopted on startup', adoption);
+          }
+          if (adoption.errors.length > 0) {
+            logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
+              repoPath: adoption.repoPath,
+              errors: adoption.errors
+            });
+          }
+        }
       }
 
       // Initialize ChromaMcpManager only if Chroma is enabled
@@ -439,7 +490,7 @@ export class WorkerService {
       // Best-effort loopback MCP self-check
       getSupervisor().assertCanSpawn('mcp server');
       const transport = new StdioClientTransport({
-        command: 'node',
+        command: process.execPath,  // Use resolved path, not bare 'node' which fails on non-interactive PATH (#1876)
         args: [mcpServerPath],
         env: sanitizeEnv(process.env)
       });
@@ -463,8 +514,11 @@ export class WorkerService {
         });
         try {
           await transport.close();
-        } catch {
-          // Best effort: the supervisor handles later process cleanup for survivors.
+        } catch (transportCloseError) {
+          // [ANTI-PATTERN IGNORED]: transport.close() is best-effort cleanup after MCP connection already failed; supervisor handles orphan processes
+          logger.debug('WORKER', 'transport.close() failed during MCP cleanup', {
+            error: transportCloseError instanceof Error ? transportCloseError.message : String(transportCloseError)
+          });
         }
         logger.info('WORKER', 'Bundled MCP server remains available for external stdio clients', {
           path: mcpServerPath
@@ -504,7 +558,40 @@ export class WorkerService {
             logger.info('SYSTEM', `Reaped ${reaped} stale sessions`);
           }
         } catch (e) {
-          logger.error('SYSTEM', 'Stale session reaper error', { error: e instanceof Error ? e.message : String(e) });
+          // [ANTI-PATTERN IGNORED]: setInterval callback cannot throw; reaper retries on next tick (every 2 min)
+          if (e instanceof Error) {
+            logger.error('WORKER', 'Stale session reaper error', {}, e);
+          } else {
+            logger.error('WORKER', 'Stale session reaper error with non-Error', {}, new Error(String(e)));
+          }
+        }
+
+        // Purge stale failed pending messages to prevent unbounded queue growth (#1957)
+        // Only remove failures older than 1 hour to preserve recent failures for inspection/retry
+        try {
+          const pendingStore = this.sessionManager.getPendingMessageStore();
+          const FAILED_MESSAGE_RETENTION_MS = 60 * 60 * 1000; // 1 hour
+          const purged = pendingStore.clearFailedOlderThan(FAILED_MESSAGE_RETENTION_MS);
+          if (purged > 0) {
+            logger.info('SYSTEM', `Purged ${purged} stale failed pending messages (older than 1h)`);
+          }
+        } catch (e) {
+          if (e instanceof Error) {
+            logger.error('WORKER', 'Failed message purge error', {}, e);
+          } else {
+            logger.error('WORKER', 'Failed message purge error with non-Error', {}, new Error(String(e)));
+          }
+        }
+
+        // Periodic WAL checkpoint to prevent unbounded WAL growth (#1956)
+        try {
+          this.dbManager.getSessionStore().db.run('PRAGMA wal_checkpoint(PASSIVE)');
+        } catch (e) {
+          if (e instanceof Error) {
+            logger.error('WORKER', 'WAL checkpoint error', {}, e);
+          } else {
+            logger.error('WORKER', 'WAL checkpoint error with non-Error', {}, new Error(String(e)));
+          }
         }
       }, 2 * 60 * 1000);
 
@@ -541,31 +628,40 @@ export class WorkerService {
     const configPath = settings.CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH || DEFAULT_CONFIG_PATH;
     const resolvedConfigPath = expandHomePath(configPath);
 
+    // Ensure sample config exists (setup, outside try)
+    if (!existsSync(resolvedConfigPath)) {
+      writeSampleConfig(configPath);
+      logger.info('TRANSCRIPT', 'Created default transcript watch config', {
+        configPath: resolvedConfigPath
+      });
+    }
+
+    const transcriptConfig = loadTranscriptWatchConfig(configPath);
+    const statePath = expandHomePath(transcriptConfig.stateFile ?? DEFAULT_STATE_PATH);
+
     try {
-      if (!existsSync(resolvedConfigPath)) {
-        writeSampleConfig(configPath);
-        logger.info('TRANSCRIPT', 'Created default transcript watch config', {
-          configPath: resolvedConfigPath
-        });
-      }
-
-      const transcriptConfig = loadTranscriptWatchConfig(configPath);
-      const statePath = expandHomePath(transcriptConfig.stateFile ?? DEFAULT_STATE_PATH);
-
       this.transcriptWatcher = new TranscriptWatcher(transcriptConfig, statePath);
       await this.transcriptWatcher.start();
-      logger.info('TRANSCRIPT', 'Transcript watcher started', {
-        configPath: resolvedConfigPath,
-        statePath,
-        watches: transcriptConfig.watches.length
-      });
     } catch (error) {
       this.transcriptWatcher?.stop();
       this.transcriptWatcher = null;
-      logger.error('TRANSCRIPT', 'Failed to start transcript watcher (continuing without Codex ingestion)', {
-        configPath: resolvedConfigPath
-      }, error as Error);
+      if (error instanceof Error) {
+        logger.error('WORKER', 'Failed to start transcript watcher (continuing without Codex ingestion)', {
+          configPath: resolvedConfigPath
+        }, error);
+      } else {
+        logger.error('WORKER', 'Failed to start transcript watcher with non-Error (continuing without Codex ingestion)', {
+          configPath: resolvedConfigPath
+        }, new Error(String(error)));
+      }
+      // [ANTI-PATTERN IGNORED]: Transcript watcher is intentionally non-fatal so Claude hooks remain usable even if transcript ingestion is misconfigured
+      return;
     }
+    logger.info('TRANSCRIPT', 'Transcript watcher started', {
+      configPath: resolvedConfigPath,
+      statePath,
+      watches: transcriptConfig.watches.length
+    });
   }
 
   /**
@@ -663,7 +759,8 @@ export class WorkerService {
         }
 
         // Detect stale resume failures - SDK session context was lost
-        if ((errorMessage.includes('aborted by user') || errorMessage.includes('No conversation found'))
+        const staleResumePatterns = ['aborted by user', 'No conversation found'];
+        if (staleResumePatterns.some(p => errorMessage.includes(p))
             && session.memorySessionId) {
           logger.warn('SDK', 'Detected stale resume failure, clearing memorySessionId for fresh start', {
             sessionId: session.sessionDbId,
@@ -729,17 +826,19 @@ export class WorkerService {
           }
           // Fall through to pending-work restart below
         }
-        const MAX_PENDING_RESTARTS = 3;
-
         if (pendingCount > 0) {
-          // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
-          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+          // Windowed restart guard: only blocks tight-loop restarts, not spread-out ones (#2053)
+          if (!session.restartGuard) session.restartGuard = new RestartGuard();
+          const restartAllowed = session.restartGuard.recordRestart();
+          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1; // Keep for logging
 
-          if (session.consecutiveRestarts > MAX_PENDING_RESTARTS) {
-            logger.error('SYSTEM', 'Exceeded max pending-work restarts, stopping to prevent infinite loop', {
+          if (!restartAllowed) {
+            logger.error('SYSTEM', 'Restart guard tripped: too many restarts in window, stopping to prevent runaway costs', {
               sessionId: session.sessionDbId,
               pendingCount,
-              consecutiveRestarts: session.consecutiveRestarts
+              restartsInWindow: session.restartGuard.restartsInWindow,
+              windowMs: session.restartGuard.windowMs,
+              maxRestarts: session.restartGuard.maxRestarts
             });
             session.consecutiveRestarts = 0;
             this.terminateSession(session.sessionDbId, 'max_restarts_exceeded');
@@ -757,10 +856,26 @@ export class WorkerService {
           this.startSessionProcessor(session, 'pending-work-restart');
           this.broadcastProcessingStatus();
         } else {
-          // Successful completion with no pending work — clean up session
-          // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
+          // Successful completion with no pending work — clean up session.
+          // Only remove from the in-memory map if finalize succeeds; otherwise
+          // leave the session in place so the 60s orphan reaper (or a future
+          // retry) can repair the inconsistency. Removing a still-"active" DB
+          // row from memory would orphan it indefinitely under the new
+          // fire-and-forget Stop hook (no /api/sessions/complete to retry).
+          session.restartGuard?.recordSuccess();
           session.consecutiveRestarts = 0;
-          this.sessionManager.removeSessionImmediate(session.sessionDbId);
+          let finalized = false;
+          try {
+            this.sessionCompletionHandler.finalizeSession(session.sessionDbId);
+            finalized = true;
+          } catch (err) {
+            logger.warn('SESSION', 'finalizeSession failed in WorkerService generator .finally()', {
+              sessionId: session.sessionDbId
+            }, err as Error);
+          }
+          if (finalized) {
+            this.sessionManager.removeSessionImmediate(session.sessionDbId);
+          }
         }
       });
   }
@@ -768,16 +883,30 @@ export class WorkerService {
   /**
    * Match errors that indicate the Claude Code process/session is gone (resume impossible).
    * Used to trigger graceful fallback instead of leaving pending messages stuck forever.
+   *
+   * These patterns come from the Claude SDK's ProcessTransport and related internals.
+   * The SDK does not export typed error classes, so string matching on normalized
+   * messages is the only reliable detection method. Each pattern corresponds to a
+   * specific SDK failure mode:
+   *   - 'process aborted by user': user cancelled the Claude Code session
+   *   - 'processtransport': transport layer disconnected
+   *   - 'not ready for writing': stdio pipe to Claude process is closed
+   *   - 'session generator failed': wrapper error from our own agent layer
+   *   - 'claude code process': process exited or was killed
    */
+  private static readonly SESSION_TERMINATED_PATTERNS = [
+    'process aborted by user',
+    'processtransport',
+    'not ready for writing',
+    'session generator failed',
+    'claude code process',
+  ] as const;
+
   private isSessionTerminatedError(error: unknown): boolean {
     const msg = error instanceof Error ? error.message : String(error);
     const normalized = msg.toLowerCase();
-    return (
-      normalized.includes('process aborted by user') ||
-      normalized.includes('processtransport') ||
-      normalized.includes('not ready for writing') ||
-      normalized.includes('session generator failed') ||
-      normalized.includes('claude code process')
+    return WorkerService.SESSION_TERMINATED_PATTERNS.some(
+      pattern => normalized.includes(pattern)
     );
   }
 
@@ -805,10 +934,15 @@ export class WorkerService {
         await this.geminiAgent.startSession(session, this);
         return;
       } catch (e) {
-        logger.warn('SDK', 'Fallback Gemini failed, trying OpenRouter', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
+        // [ANTI-PATTERN IGNORED]: Fallback chain by design — Gemini failure falls through to OpenRouter attempt
+        if (e instanceof Error) {
+          logger.warn('WORKER', 'Fallback Gemini failed, trying OpenRouter', {
+            sessionId: sessionDbId,
+          });
+          logger.error('WORKER', 'Gemini fallback error detail', { sessionId: sessionDbId }, e);
+        } else {
+          logger.error('WORKER', 'Gemini fallback failed with non-Error', { sessionId: sessionDbId }, new Error(String(e)));
+        }
       }
     }
 
@@ -817,10 +951,12 @@ export class WorkerService {
         await this.openRouterAgent.startSession(session, this);
         return;
       } catch (e) {
-        logger.warn('SDK', 'Fallback OpenRouter failed', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
+        // [ANTI-PATTERN IGNORED]: Last fallback in chain — failure falls through to message abandonment, which is the designed terminal behavior
+        if (e instanceof Error) {
+          logger.error('WORKER', 'Fallback OpenRouter failed, will abandon messages', { sessionId: sessionDbId }, e);
+        } else {
+          logger.error('WORKER', 'Fallback OpenRouter failed with non-Error, will abandon messages', { sessionId: sessionDbId }, new Error(String(e)));
+        }
       }
     }
 
@@ -833,8 +969,25 @@ export class WorkerService {
         abandoned
       });
     }
-    this.sessionManager.removeSessionImmediate(sessionDbId);
-    this.sessionEventBroadcaster.broadcastSessionCompleted(sessionDbId);
+    // Finalize so DB status + broadcast + pending-drain are consistent on fallback failure.
+    // finalizeSession already broadcasts session_completed, so we don't also call
+    // broadcastSessionCompleted below. On finalize failure, fall back to the
+    // explicit broadcast so the UI still gets the event and leave the session
+    // in memory for the orphan reaper to retry.
+    let finalized = false;
+    try {
+      this.sessionCompletionHandler.finalizeSession(sessionDbId);
+      finalized = true;
+    } catch (err) {
+      logger.warn('SESSION', 'finalizeSession failed in runFallbackForTerminatedSession', {
+        sessionId: sessionDbId
+      }, err as Error);
+    }
+    if (finalized) {
+      this.sessionManager.removeSessionImmediate(sessionDbId);
+    } else {
+      this.sessionEventBroadcaster.broadcastSessionCompleted(sessionDbId);
+    }
   }
 
   /**
@@ -857,8 +1010,25 @@ export class WorkerService {
       abandonedMessages: abandoned
     });
 
-    // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
-    this.sessionManager.removeSessionImmediate(sessionDbId);
+    // Finalize session (mark completed in DB + drain pending + broadcast). Idempotent.
+    // This runs AFTER startSession() has returned, which means any summary/observation
+    // writes inside processAgentResponse() are already committed to SQLite synchronously.
+    // Only remove from the in-memory map if finalize succeeds; otherwise leave the
+    // session in place so the 60s orphan reaper can repair the DB inconsistency.
+    let finalized = false;
+    try {
+      this.sessionCompletionHandler.finalizeSession(sessionDbId);
+      finalized = true;
+    } catch (err) {
+      logger.warn('SESSION', 'finalizeSession failed during terminateSession', {
+        sessionId: sessionDbId, reason
+      }, err as Error);
+    }
+
+    if (finalized) {
+      // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
+      this.sessionManager.removeSessionImmediate(sessionDbId);
+    }
   }
 
   /**
@@ -879,37 +1049,50 @@ export class WorkerService {
     const STALE_SESSION_THRESHOLD_MS = 6 * 60 * 60 * 1000;
     const staleThreshold = Date.now() - STALE_SESSION_THRESHOLD_MS;
 
-    try {
-      const staleSessionIds = sessionStore.db.prepare(`
-        SELECT id FROM sdk_sessions
-        WHERE status = 'active' AND started_at_epoch < ?
-      `).all(staleThreshold) as { id: number }[];
+    const staleSessionIds = sessionStore.db.prepare(`
+      SELECT id FROM sdk_sessions
+      WHERE status = 'active' AND started_at_epoch < ?
+    `).all(staleThreshold) as { id: number }[];
 
-      if (staleSessionIds.length > 0) {
-        const ids = staleSessionIds.map(r => r.id);
-        const placeholders = ids.map(() => '?').join(',');
+    if (staleSessionIds.length > 0) {
+      const ids = staleSessionIds.map(r => r.id);
+      const placeholders = ids.map(() => '?').join(',');
+      const now = Date.now();
 
+      try {
         sessionStore.db.prepare(`
           UPDATE sdk_sessions
           SET status = 'failed', completed_at_epoch = ?
           WHERE id IN (${placeholders})
-        `).run(Date.now(), ...ids);
-
+        `).run(now, ...ids);
         logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
+      } catch (error) {
+        // [ANTI-PATTERN IGNORED]: Stale session cleanup is best-effort; pending queue processing below must still proceed
+        if (error instanceof Error) {
+          logger.error('WORKER', 'Failed to mark stale sessions as failed', { staleCount: ids.length }, error);
+        } else {
+          logger.error('WORKER', 'Failed to mark stale sessions as failed with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        }
+      }
 
+      try {
         const msgResult = sessionStore.db.prepare(`
           UPDATE pending_messages
           SET status = 'failed', failed_at_epoch = ?
           WHERE status = 'pending'
           AND session_db_id IN (${placeholders})
-        `).run(Date.now(), ...ids);
-
+        `).run(now, ...ids);
         if (msgResult.changes > 0) {
           logger.info('SYSTEM', `Marked ${msgResult.changes} pending messages from stale sessions as failed`);
         }
+      } catch (error) {
+        // [ANTI-PATTERN IGNORED]: Pending message cleanup is best-effort; queue processing below must still proceed
+        if (error instanceof Error) {
+          logger.error('WORKER', 'Failed to clean up stale pending messages', { staleCount: ids.length }, error);
+        } else {
+          logger.error('WORKER', 'Failed to clean up stale pending messages with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        }
       }
-    } catch (error) {
-      logger.error('SYSTEM', 'Failed to clean up stale sessions', {}, error as Error);
     }
 
     const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
@@ -928,28 +1111,34 @@ export class WorkerService {
     for (const sessionDbId of orphanedSessionIds) {
       if (result.sessionsStarted >= sessionLimit) break;
 
+      const existingSession = this.sessionManager.getSession(sessionDbId);
+      if (existingSession?.generatorPromise) {
+        result.sessionsSkipped++;
+        continue;
+      }
+
       try {
-        const existingSession = this.sessionManager.getSession(sessionDbId);
-        if (existingSession?.generatorPromise) {
-          result.sessionsSkipped++;
-          continue;
-        }
-
         const session = this.sessionManager.initializeSession(sessionDbId);
-        logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
-          project: session.project,
-          pendingCount: pendingStore.getPendingCount(sessionDbId)
-        });
-
         this.startSessionProcessor(session, 'startup-recovery');
         result.sessionsStarted++;
         result.startedSessionIds.push(sessionDbId);
-
-        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (error) {
-        logger.error('SYSTEM', `Failed to process session ${sessionDbId}`, {}, error as Error);
+        if (error instanceof Error) {
+          logger.error('WORKER', `Failed to initialize/start session ${sessionDbId}`, { sessionDbId }, error);
+        } else {
+          logger.error('WORKER', `Failed to initialize/start session ${sessionDbId} with non-Error`, { sessionDbId }, new Error(String(error)));
+        }
         result.sessionsSkipped++;
+        // [ANTI-PATTERN IGNORED]: Per-session failure must not abort the loop; other sessions may still be recoverable
+        continue;
       }
+
+      logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
+        project: this.sessionManager.getSession(sessionDbId)?.project,
+        pendingCount: pendingStore.getPendingCount(sessionDbId)
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     return result;
@@ -1187,12 +1376,54 @@ async function main() {
       break;
     }
 
+    case 'adopt': {
+      const dryRun = process.argv.includes('--dry-run');
+      const branchIndex = process.argv.indexOf('--branch');
+      const branchValue = branchIndex !== -1 ? process.argv[branchIndex + 1] : undefined;
+      if (branchIndex !== -1 && (!branchValue || branchValue.startsWith('--'))) {
+        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
+        process.exit(1);
+      }
+      const onlyBranch = branchValue;
+      // Honor an explicit --cwd override so the NPX CLI can pass through the
+      // user's working directory (the spawn sets cwd to the marketplace dir).
+      const cwdIndex = process.argv.indexOf('--cwd');
+      const cwdValue = cwdIndex !== -1 ? process.argv[cwdIndex + 1] : undefined;
+      if (cwdIndex !== -1 && (!cwdValue || cwdValue.startsWith('--'))) {
+        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
+        process.exit(1);
+      }
+      const repoPath = cwdValue ?? process.cwd();
+
+      const result = await adoptMergedWorktrees({ repoPath, dryRun, onlyBranch });
+
+      const tag = result.dryRun ? '(dry-run)' : '(applied)';
+      console.log(`\nWorktree adoption ${tag}`);
+      console.log(`  Parent project:       ${result.parentProject || '(unknown)'}`);
+      console.log(`  Repo:                 ${result.repoPath}`);
+      console.log(`  Worktrees scanned:    ${result.scannedWorktrees}`);
+      console.log(`  Merged branches:      ${result.mergedBranches.join(', ') || '(none)'}`);
+      console.log(`  Observations adopted: ${result.adoptedObservations}`);
+      console.log(`  Summaries adopted:    ${result.adoptedSummaries}`);
+      console.log(`  Chroma docs updated:  ${result.chromaUpdates}`);
+      if (result.chromaFailed > 0) {
+        console.log(`  Chroma sync failures: ${result.chromaFailed} (will retry on next run)`);
+      }
+      for (const err of result.errors) {
+        console.log(`  ! ${err.worktree}: ${err.error}`);
+      }
+      process.exit(0);
+    }
+
     case '--daemon':
     default: {
-      // GUARD 1: Refuse to start if another worker is already alive (PID check).
-      // Instant check (kill -0) — no HTTP dependency.
+      // GUARD 1: Refuse to start if another worker is already alive.
+      // Verifies PID *identity* (via start-time token) not just liveness, so a
+      // stale PID file pointing at a PID that's since been reused by an
+      // unrelated process (e.g. container restart reusing low PIDs) doesn't
+      // false-positive.
       const existingPidInfo = readPidFile();
-      if (existingPidInfo && isProcessAlive(existingPidInfo.pid)) {
+      if (verifyPidFileOwnership(existingPidInfo)) {
         logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {
           existingPid: existingPidInfo.pid,
           existingPort: existingPidInfo.port,

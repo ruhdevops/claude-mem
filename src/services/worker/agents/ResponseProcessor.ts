@@ -13,7 +13,9 @@
 
 import { logger } from '../../../utils/logger.js';
 import { parseObservations, parseSummary, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
+import { SUMMARY_MODE_MARKER, MAX_CONSECUTIVE_SUMMARY_FAILURES } from '../../../sdk/prompts.js';
 import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
+import { notifyTelegram } from '../../integrations/TelegramNotifier.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
@@ -67,19 +69,43 @@ export async function processAgentResponse(
 
   // Parse observations and summary
   const observations = parseObservations(text, session.contentSessionId);
-  const summary = parseSummary(text, session.sessionDbId);
 
-  if (
+  // Detect whether the most recent prompt was a summary request.
+  // If so, enable observation-to-summary coercion to prevent the infinite
+  // retry loop described in #1633.
+  const lastMessage = session.conversationHistory.at(-1);
+  const lastUserMessage = lastMessage?.role === 'user'
+    ? lastMessage
+    : session.conversationHistory.findLast(m => m.role === 'user') ?? null;
+  const summaryExpected = lastUserMessage?.content?.includes(SUMMARY_MODE_MARKER) ?? false;
+
+  const summary = parseSummary(text, session.sessionDbId, summaryExpected);
+
+  // Detect non-XML responses (auth errors, rate limits, garbled output).
+  // When the response contains no parseable XML and produced no observations,
+  // mark the pending messages as failed instead of confirming them — this prevents
+  // silent data loss when the LLM returns garbage (#1874).
+  const isNonXmlResponse = (
     text.trim() &&
     observations.length === 0 &&
     !summary &&
     !/<observation>|<summary>|<skip_summary\b/.test(text)
-  ) {
+  );
+
+  if (isNonXmlResponse) {
     const preview = text.length > 200 ? `${text.slice(0, 200)}...` : text;
-    logger.warn('PARSER', `${agentName} returned non-XML response; observation content was discarded`, {
+    logger.warn('PARSER', `${agentName} returned non-XML response; marking messages as failed for retry (#1874)`, {
       sessionId: session.sessionDbId,
       preview
     });
+
+    // Mark messages as failed (retry logic in PendingMessageStore handles retries)
+    const pendingStore = sessionManager.getPendingMessageStore();
+    for (const messageId of session.processingMessageIds) {
+      pendingStore.markFailed(messageId);
+    }
+    session.processingMessageIds = [];
+    return;
   }
 
   // Convert nullable fields to empty strings for storeSummary (if summary exists)
@@ -107,18 +133,36 @@ export async function processAgentResponse(
     memorySessionId: session.memorySessionId
   });
 
+  // Label observations with the subagent identity captured from the claimed messages.
+  // Main-session messages leave these null, so main-session rows stay NULL in the DB.
+  const labeledObservations = observations.map(obs => ({
+    ...obs,
+    agent_type: session.pendingAgentType ?? null,
+    agent_id: session.pendingAgentId ?? null
+  }));
+
   // ATOMIC TRANSACTION: Store observations + summary ONCE
-  // Messages are already deleted from queue on claim, so no completion tracking needed
-  const result = sessionStore.storeObservations(
-    session.memorySessionId,
-    session.project,
-    observations,
-    summaryForStore,
-    session.lastPromptNumber,
-    discoveryTokens,
-    originalTimestamp ?? undefined,
-    modelId
-  );
+  // Messages are already deleted from queue on claim, so no completion tracking needed.
+  // Wrap in try/finally so the subagent tracker clears even if storage throws —
+  // otherwise stale identity could leak into the next batch and mislabel rows.
+  // Expected invariant: all observations in a batch share the same agent context,
+  // because ResponseProcessor runs after a single agent-response cycle.
+  let result: ReturnType<typeof sessionStore.storeObservations>;
+  try {
+    result = sessionStore.storeObservations(
+      session.memorySessionId,
+      session.project,
+      labeledObservations,
+      summaryForStore,
+      session.lastPromptNumber,
+      discoveryTokens,
+      originalTimestamp ?? undefined,
+      modelId
+    );
+  } finally {
+    session.pendingAgentId = null;
+    session.pendingAgentType = null;
+  }
 
   // Log storage result with IDs for end-to-end traceability
   logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
@@ -130,6 +174,32 @@ export async function processAgentResponse(
   // to the Stop hook for silent-summary-loss detection (#1633)
   session.lastSummaryStored = result.summaryId !== null;
 
+  // Circuit breaker: track consecutive summary failures (#1633).
+  // Only evaluate when a summary was actually expected (summarize message was sent).
+  // Without this guard, the counter would increment on every normal observation
+  // response, tripping the breaker after 3 observations and permanently blocking
+  // summarization — reproducing the data-loss scenario this fix is meant to prevent.
+  if (summaryExpected) {
+    const skippedIntentionally = /<skip_summary\b/.test(text);
+    if (summaryForStore !== null) {
+      // Summary was present in the response — reset the failure counter
+      session.consecutiveSummaryFailures = 0;
+    } else if (skippedIntentionally) {
+      // Explicit <skip_summary/> is a valid protocol response — neither success
+      // nor failure. Leave the counter unchanged so we don't mask a bad run that
+      // happens to end on a skip, but also don't punish intentional skips.
+    } else {
+      // Summary was expected but none was stored — count as failure
+      session.consecutiveSummaryFailures += 1;
+      if (session.consecutiveSummaryFailures >= MAX_CONSECUTIVE_SUMMARY_FAILURES) {
+        logger.error('SESSION', `Circuit breaker: ${session.consecutiveSummaryFailures} consecutive summary failures — further summarize requests will be skipped (#1633)`, {
+          sessionId: session.sessionDbId,
+          contentSessionId: session.contentSessionId
+        });
+      }
+    }
+  }
+
   // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
   // This is the critical step that prevents message loss on generator crash
   const pendingStore = sessionManager.getPendingMessageStore();
@@ -138,9 +208,18 @@ export async function processAgentResponse(
   }
   if (session.processingMessageIds.length > 0) {
     logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
+    // Record successful processing so restart guard decay is anchored to real successes
+    session.restartGuard?.recordSuccess();
   }
   // Clear the tracking array after confirmation
   session.processingMessageIds = [];
+
+  void notifyTelegram({
+    observations: labeledObservations,
+    observationIds: result.observationIds,
+    project: session.project,
+    memorySessionId: session.memorySessionId,
+  });
 
   // AFTER transaction commits - async operations (can fail safely without data loss)
   await syncAndBroadcastObservations(

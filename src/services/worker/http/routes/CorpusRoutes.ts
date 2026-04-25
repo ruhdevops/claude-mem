@@ -7,12 +7,13 @@
 
 import express, { Request, Response } from 'express';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
+import { logger } from '../../../../utils/logger.js';
 import { CorpusStore } from '../../knowledge/CorpusStore.js';
 import { CorpusBuilder } from '../../knowledge/CorpusBuilder.js';
 import { KnowledgeAgent } from '../../knowledge/KnowledgeAgent.js';
 import type { CorpusFilter } from '../../knowledge/types.js';
 
-const ALLOWED_CORPUS_TYPES = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+const ALLOWED_CORPUS_TYPES = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change', 'security_alert', 'security_note']);
 
 export class CorpusRoutes extends BaseRouteHandler {
   constructor(
@@ -93,7 +94,10 @@ export class CorpusRoutes extends BaseRouteHandler {
     if (typeof value === 'string') {
       try {
         parsed = JSON.parse(value);
-      } catch {
+      } catch (parseError: unknown) {
+        if (parseError instanceof Error) {
+          logger.debug('HTTP', `${fieldName} is not valid JSON, treating as comma-separated string`, { value });
+        }
         parsed = value.split(',').map(part => part.trim()).filter(Boolean);
       }
     }

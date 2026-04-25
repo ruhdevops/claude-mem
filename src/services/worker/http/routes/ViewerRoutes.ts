@@ -38,7 +38,14 @@ export class ViewerRoutes extends BaseRouteHandler {
    * Health check endpoint
    */
   private handleHealth = this.wrapHandler((req: Request, res: Response): void => {
-    res.json({ status: 'ok', timestamp: Date.now() });
+    // Include queue liveness info so monitoring can detect dead queues (#1867)
+    const activeSessions = this.sessionManager.getActiveSessionCount();
+
+    res.json({
+      status: 'ok',
+      timestamp: Date.now(),
+      activeSessions
+    });
   });
 
   /**
@@ -71,7 +78,10 @@ export class ViewerRoutes extends BaseRouteHandler {
     // Guard: if DB is not yet initialized, return 503 before registering client
     try {
       this.dbManager.getSessionStore();
-    } catch {
+    } catch (initError: unknown) {
+      if (initError instanceof Error) {
+        logger.warn('HTTP', 'SSE stream requested before DB initialization', {}, initError);
+      }
       res.status(503).json({ error: 'Service initializing' });
       return;
     }

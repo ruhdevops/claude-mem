@@ -115,10 +115,15 @@ function notifySlotAvailable(): void {
  * Wait for a pool slot to become available (promise-based, not polling)
  * @param maxConcurrent Max number of concurrent agents
  * @param timeoutMs Max time to wait before giving up
+ * @param evictIdleSession Optional callback to evict an idle session when all slots are full (#1868)
  */
 const TOTAL_PROCESS_HARD_CAP = 10;
 
-export async function waitForSlot(maxConcurrent: number, timeoutMs: number = 60_000): Promise<void> {
+export async function waitForSlot(
+  maxConcurrent: number,
+  timeoutMs: number = 60_000,
+  evictIdleSession?: () => boolean
+): Promise<void> {
   // Hard cap: refuse to spawn if too many processes exist regardless of pool accounting
   const activeCount = getActiveCount();
   if (activeCount >= TOTAL_PROCESS_HARD_CAP) {
@@ -126,6 +131,17 @@ export async function waitForSlot(maxConcurrent: number, timeoutMs: number = 60_
   }
 
   if (activeCount < maxConcurrent) return;
+
+  // Try to evict an idle session before waiting (#1868)
+  // Idle sessions hold pool slots during their 3-min idle timeout, blocking new sessions
+  // that would timeout after 60s. Eviction aborts the idle session asynchronously —
+  // the freed slot is picked up by the waiter mechanism below.
+  if (evictIdleSession) {
+    const evicted = evictIdleSession();
+    if (evicted) {
+      logger.info('PROCESS', 'Evicted idle session to free pool slot for waiting request');
+    }
+  }
 
   logger.info('PROCESS', `Pool limit reached (${activeCount}/${maxConcurrent}), waiting for slot...`);
 
@@ -395,8 +411,11 @@ export function createPidCapturingSpawn(sessionDbId: number) {
       try {
         existing.process.kill('SIGTERM');
         exited = existing.process.exitCode !== null;
-      } catch {
+      } catch (error: unknown) {
         // Already dead — safe to unregister immediately
+        if (error instanceof Error) {
+          logger.warn('WORKER', `Failed to kill duplicate process PID ${existing.pid}, likely already dead`, { existingPid: existing.pid, sessionDbId }, error);
+        }
         exited = true;
       }
 
@@ -495,7 +514,11 @@ export function startOrphanReaper(getActiveSessionIds: () => Set<number>, interv
         logger.info('PROCESS', `Reaper cleaned up ${killed} orphaned processes`, { killed });
       }
     } catch (error) {
-      logger.error('PROCESS', 'Reaper error', {}, error as Error);
+      if (error instanceof Error) {
+        logger.error('WORKER', 'Reaper error', {}, error);
+      } else {
+        logger.error('WORKER', 'Reaper error', { rawError: String(error) });
+      }
     }
   }, intervalMs);
 

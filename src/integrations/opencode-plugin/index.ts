@@ -101,21 +101,19 @@ const MAX_TOOL_RESPONSE_LENGTH = 1000;
 // Worker HTTP Client
 // ============================================================================
 
+const JSON_HEADERS: Record<string, string> = { "Content-Type": "application/json" };
+
 async function workerPost(
   path: string,
   body: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
+  let response: Response;
   try {
-    const response = await fetch(`${WORKER_BASE_URL}${path}`, {
+    response = await fetch(`${WORKER_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: JSON_HEADERS,
       body: JSON.stringify(body),
     });
-    if (!response.ok) {
-      console.warn(`[claude-mem] Worker POST ${path} returned ${response.status}`);
-      return null;
-    }
-    return (await response.json()) as Record<string, unknown>;
   } catch (error: unknown) {
     // Gracefully handle ECONNREFUSED — worker may not be running
     const message = error instanceof Error ? error.message : String(error);
@@ -124,6 +122,12 @@ async function workerPost(
     }
     return null;
   }
+
+  if (!response.ok) {
+    console.warn(`[claude-mem] Worker POST ${path} returned ${response.status}`);
+    return null;
+  }
+  return (await response.json()) as Record<string, unknown>;
 }
 
 function workerPostFireAndForget(
@@ -132,7 +136,7 @@ function workerPostFireAndForget(
 ): void {
   fetch(`${WORKER_BASE_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_HEADERS,
     body: JSON.stringify(body),
   }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -144,7 +148,7 @@ function workerPostFireAndForget(
 
 async function workerGetText(path: string): Promise<string | null> {
   try {
-    const response = await fetch(`${WORKER_BASE_URL}${path}`);
+    const response = await fetch(`${WORKER_BASE_URL}${path}`, { headers: JSON_HEADERS });
     if (!response.ok) {
       console.warn(`[claude-mem] Worker GET ${path} returned ${response.status}`);
       return null;
@@ -339,24 +343,27 @@ export const ClaudeMemPlugin = async (ctx: OpenCodePluginContext) => {
             return "claude-mem worker is not running. Start it with: npx claude-mem start";
           }
 
+          let data: any;
           try {
-            const data = JSON.parse(text);
-            const items = Array.isArray(data.items) ? data.items : [];
-            if (items.length === 0) {
-              return `No results found for "${query}".`;
-            }
-
-            return items
-              .slice(0, 10)
-              .map((item: Record<string, unknown>, index: number) => {
-                const title = String(item.title || item.subtitle || "Untitled");
-                const project = item.project ? ` [${String(item.project)}]` : "";
-                return `${index + 1}. ${title}${project}`;
-              })
-              .join("\n");
-          } catch {
+            data = JSON.parse(text);
+          } catch (error: unknown) {
+            console.warn('[claude-mem] Failed to parse search results:', error instanceof Error ? error.message : String(error));
             return "Failed to parse search results.";
           }
+
+          const items = Array.isArray(data.items) ? data.items : [];
+          if (items.length === 0) {
+            return `No results found for "${query}".`;
+          }
+
+          return items
+            .slice(0, 10)
+            .map((item: Record<string, unknown>, index: number) => {
+              const title = String(item.title || item.subtitle || "Untitled");
+              const project = item.project ? ` [${String(item.project)}]` : "";
+              return `${index + 1}. ${title}${project}`;
+            })
+            .join("\n");
         },
       } satisfies ToolDefinition,
     },
